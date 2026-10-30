@@ -2,10 +2,457 @@
 title: "A2 ACTL3162"
 author: "Nikola Drpa"
 date: "2026-10-29"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 ---
 
 ```{r}
+### Global Parameters ###
+c_0 <- 55
+theta <- 0.08
+reins_loading <- 0.12
+horizon <- 60 
+prodA_alpha <- 0.80
+prodB_d <- 3.889
 
+### Establishing Claim Arrival/Size Distribution ###
+claim_scenarios <- data.frame(scenario = c("1", "2", "3", "4"),
+                              lambda = c(2.4, 2.4, 4.8, 4.8),
+                              shape  = c(1, 0.35, 1, 0.45),
+                              rate   = c(0.8, 0.28, 1.6, 0.72))
+
+### Set Seed ###
+set.seed(676)
+```
+
+
+```{r}
+### Question 1 - Estimating Ruin Probability ###
+# Estimating Function 
+est_ruin_prob <- function(lambda, shape, rate,
+                         c0 = 55, theta = 0.08, horizon = 60, n_sim = 1e5) {
+  #Expected Claim Size
+  EY   <- shape / rate  
+  #Premium Rate per Month
+  prem <- (1 + theta) * lambda * EY      
+  
+  ruined <- vapply(seq_len(n_sim), function(i) {
+    #Number of Claims
+    N <- rpois(1, lambda * horizon)       
+    if (N == 0) return(FALSE)
+    #Claim Arrival Times
+    times <- sort(runif(N, 0, horizon)) 
+    Y     <- rgamma(N, shape = shape, rate = rate)
+    #Surplus as C(t)
+    any(c0 + prem * times - cumsum(Y) < 0)
+  }, logical(1))
+  
+  p  <- mean(ruined)
+  se <- sqrt(p * (1 - p) / n_sim)
+  c(psi = p, se = se, lower = p - 1.96 * se, upper = p + 1.96 * se)
+}
+
+### Q1 Results
+ruin_probability <- t(sapply(seq_len(nrow(claim_scenarios)), function(n)
+  est_ruin_prob(claim_scenarios$lambda[n], claim_scenarios$shape[n], claim_scenarios$rate[n])))
+
+ruin_probability <- data.frame(scenario = claim_scenarios$scenario, ruin_probability)
+
+# Which Scenario Does not Meet 99% ?
+ruin_probability$survival <- 1 - ruin_probability$psi
+
+ruin_probability
+
+# Claim Variability Diagnostics 
+claim_scenarios$EY         <- claim_scenarios$shape / claim_scenarios$rate
+claim_scenarios$CV         <- 1 / sqrt(claim_scenarios$shape)
+claim_scenarios$agg_mean   <- claim_scenarios$lambda * claim_scenarios$EY
+claim_scenarios$agg_var    <- claim_scenarios$lambda * claim_scenarios$shape *
+                              (claim_scenarios$shape + 1) / claim_scenarios$rate^2
+claim_scenarios$premium    <- (1 + theta) * claim_scenarios$agg_mean
+print(claim_scenarios)
+
+# Truncate Negative CI Lower Bound at Zero
+ruin_probability$lower <- pmax(ruin_probability$lower, 0)
+print(ruin_probability)
+
+# Ruin Probability Ratios
+cat("Scenario I / III:", ruin_probability$psi[1] / ruin_probability$psi[3], "\n")
+cat("Scenario II / I:",  ruin_probability$psi[2] / ruin_probability$psi[1], "\n")
+```
+```{r}
+### Question 2 - Analysis of Reinsurance Products ###
+## a) Cede Same Expected Claim Amount
+scenario2 <- claim_scenarios[claim_scenarios$scenario == "2", ]
+lambda_sc2 <- scenario2$lambda
+shape_sc2 <- scenario2$shape
+rate_sc2 <- scenario2$rate
+scen2_EY <- shape_sc2 / rate_sc2
+
+# Product A - Proportional Reinsurance
+exp_claim_ceded_prodA <- function(alpha, shape = shape_sc2, rate = rate_sc2) {
+  EY <- shape / rate
+  (1 - alpha) * EY
+}
+
+# Product B - Excess of Loss Reinsurance
+exp_claim_ceded_prodB <- function(d, shape = shape_sc2, rate = rate_sc2){
+  if (is.infinite(d)) return (0)
+  EY <- shape / rate
+  EY * pgamma(d, shape + 1, rate, lower.tail = FALSE) - d * pgamma(d, shape, rate, lower.tail = FALSE)
+}
+
+# Results
+amount_ceded_A <- exp_claim_ceded_prodA(prodA_alpha)
+amount_ceded_B <- exp_claim_ceded_prodB(prodB_d)
+
+cat("Amount Ceded Under Product A:", amount_ceded_A, "\n")
+cat("Amount Ceded Under Product B:", amount_ceded_B, "\n")
+
+# Reinsurance Premium Rate 
+reinsurance_prem_rate <- function(type = "none", alpha = 1, d = Inf,
+                            lambda = lambda_sc2, xi = reins_loading) {
+  amount_ceded <- switch(type,
+                  none = 0,
+                  prop_prodA = exp_claim_ceded_prodA(alpha),
+                  xl_prodB   = exp_claim_ceded_prodB(d),
+                  stop("type must be selected"))
+  (1 + xi) * lambda * amount_ceded
+}
+
+premium_rates_q2 <- data.frame(
+  product         = c("None", "A", "B"),
+  reins_prem_rate = c(reinsurance_prem_rate("none"),
+                      reinsurance_prem_rate("prop_prodA", alpha = prodA_alpha),
+                      reinsurance_prem_rate("xl_prodB",   d = prodB_d)))
+premium_rates_q2$net_prem_rate <- (1 + theta) * lambda_sc2 * scen2_EY - premium_rates_q2$reins_prem_rate
+print(premium_rates_q2)
+
+# Updated Ruin Probability Function
+est_ruin_prob_reins <- function(type = "none", alpha = 1, d = Inf, lambda = lambda_sc2, shape = shape_sc2, rate = rate_sc2, c0 = c_0, loading = theta, xi = reins_loading, t_max = horizon, n_sim = 1e5) {
+  EY       <- shape / rate
+  # Net Premium 
+  prem_net <- (1 + loading) * lambda * EY - reinsurance_prem_rate(type, alpha, d, lambda, xi)
+
+  ruined <- vapply(seq_len(n_sim), function(i) {
+    # Number of Claims
+    N <- rpois(1, lambda * t_max)
+    if (N == 0) return(FALSE)
+    # Claim Arrival Times
+    times <- sort(runif(N, 0, t_max))
+    Y     <- rgamma(N, shape = shape, rate = rate)
+    # Retained Portion of Each Claim
+    Y_ret <- switch(type, 
+                    none = Y, 
+                    prop_prodA = alpha * Y, 
+                    xl_prodB = pmin(Y, d),
+                    stop("type must be selected"))
+    any(c0 + prem_net * times - cumsum(Y_ret) < 0)
+  }, logical(1))
+
+  p  <- mean(ruined)
+  se <- sqrt(p * (1 - p) / n_sim)
+  c(psi = p, se = se, lower = p - 1.96 * se, upper = p + 1.96 * se)
+}
+
+# Ruin Probability - No Reinsurance Products
+est_ruin_prod0 <- est_ruin_prob_reins(type = "none")
+
+# Ruin Probability - Product A
+est_ruin_prodA <- est_ruin_prob_reins(type = "prop_prodA", alpha = prodA_alpha)
+
+# Ruin Probability - Product B
+est_ruin_prodB <- est_ruin_prob_reins(type = "xl_prodB", d = prodB_d)
+
+print(est_ruin_prodA)
+print(est_ruin_prodB)
+
+# Results 
+ruin_probabilities_q2 <- rbind(est_ruin_prod0, est_ruin_prodA, est_ruin_prodB)
+ruin_probabilities_q2 <- data.frame(ruin_probabilities_q2)
+ruin_probabilities_q2$risk_reduction_pct <- 100 * (1 - ruin_probabilities_q2$psi / ruin_probabilities_q2$psi[1])
+print(ruin_probabilities_q2)
+```
+```{r}
+## b) Admissible Range of Alpha and d
+#Product A 
+minimum_alpha <- (reins_loading - theta) /  reins_loading
+
+minimum_alpha
+
+#Product B
+minimum_d <- uniroot(function(dd) reins_loading * exp_claim_ceded_prodB(dd) - theta * scen2_EY, c(1e-6, 50), tol = 1e-10)$root
+
+minimum_d
+```
+
+```{r}
+## c)
+# MGFs of the Retained Claim Amount
+# No Reinsurance
+mgf_none <- mgf_none <- function(r, shape = shape_sc2, rate = rate_sc2) {
+  
+  (1 - r / rate)^(-shape)
+  
+}
+
+# Product A 
+mgf_prodA <- function(r, alpha, shape = shape_sc2, rate = rate_sc2) {
+  
+  (1 - r * alpha / rate)^(-shape)
+  
+}
+
+# Product B
+mgf_prodB <- function(r, d, shape = shape_sc2, rate = rate_sc2) {
+  
+  tail_end_part <- exp(r * d) * pgamma(d, shape, rate, lower.tail = FALSE)
+  
+  centre_body_part <- if (r < rate) {
+    (rate / (rate - r))^shape * pgamma(d, shape, rate - r)
+  } else {
+    integrate(function(y) exp(r * y) * dgamma(y, shape, rate), 0, d)$value
+  }
+  
+  centre_body_part + tail_end_part
+}
+
+## Adjusted Coefficients 
+# No Reinsurance
+adj_coef_none <- function(lambda = lambda_sc2, shape = shape_sc2, rate = rate_sc2, loading = theta) {
+  
+  prem     <- (1 + loading) * lambda * shape / rate
+  
+  lundberg <- function(r) lambda * (mgf_none(r, shape, rate) - 1) - prem * r
+  
+  uniroot(lundberg, c(1e-8, rate * (1 - 1e-8)), tol = 1e-12)$root
+}
+
+# Product A
+adj_coef_prodA <- function(alpha, lambda = lambda_sc2, shape = shape_sc2, rate = rate_sc2, loading = theta, xi = reins_loading) {
+  
+  prem_net <- (1 + loading) * lambda * shape / rate -
+    reinsurance_prem_rate("prop_prodA", alpha = alpha, lambda = lambda, xi = xi)
+  
+  lundberg <- function(r) lambda * (mgf_prodA(r, alpha, shape, rate) - 1) - prem_net * r
+  
+  uniroot(lundberg, c(1e-8, (rate / alpha) * (1 - 1e-8)), tol = 1e-12)$root
+}
+
+# Product B
+adj_coef_prodB <- function(d, lambda = lambda_sc2, shape = shape_sc2, rate = rate_sc2, loading = theta, xi = reins_loading) {
+  
+  prem_net <- (1 + loading) * lambda * shape / rate -
+    reinsurance_prem_rate("xl_prodB", d = d, lambda = lambda, xi = xi)
+  
+  lundberg <- function(r) lambda * (mgf_prodB(r, d, shape, rate) - 1) -   prem_net * r
+  
+  r_upper <- 0.1
+  
+  while (lundberg(r_upper) <= 0) r_upper <- 2 * r_upper
+  uniroot(lundberg, c(1e-8, r_upper), tol = 1e-12)$root
+}
+
+# Results
+R_none <- adj_coef_none()
+
+# Maximise R using Optimize for the Reinsurance Products
+max_adjc_prodA <- optimize(adj_coef_prodA, c(minimum_alpha + 0.01, 1), maximum = TRUE)
+max_adjc_prodB <- optimize(adj_coef_prodB, c(minimum_d + 0.05, 50),   maximum = TRUE)
+
+q2c_adjc_results <- data.frame(
+  Product  = c("No reinsurance", "Product A (optimal)", "Product B (optimal)"),
+  Maximising_Parameter = c(NA, max_adjc_prodA$maximum, max_adjc_prodB$maximum),
+  R         = c(adj_coef_none(), max_adjc_prodA$objective, max_adjc_prodB$objective))
+
+q2c_adjc_results$lundberg_upper_bound <- exp(-q2c_adjc_results$R * c_0)
+print(q2c_adjc_results) 
+```
+
+
+```{r}
+### Q3 - Reinsurance Recommendations
+exp_profit_rate_q3 <- function(type = "none", alpha = 1, d = Inf, lambda = lambda_sc2, EY = scen2_EY, loading = theta, xi = reins_loading) {
+  
+  amount_ceded <- switch(type,
+                         none       = 0,
+                         prop_prodA = exp_claim_ceded_prodA(alpha),
+                         xl_prodB   = exp_claim_ceded_prodB(d),
+                        stop("type must be selected"))
+  net_prem <- (1 + loading) * lambda * EY - reinsurance_prem_rate(type, alpha, d, lambda, xi)
+  
+  net_prem - lambda * (EY - amount_ceded)
+}
+
+# Expected Profit Results 
+exp_profit_prodA <- exp_profit_rate_q3(type = "prop_prodA", alpha = prodA_alpha)
+exp_profit_prodB <- exp_profit_rate_q3(type = "xl_prodB", d = prodB_d)
+q3_exp_profit_results <- rbind(exp_profit_prodA, exp_profit_prodB)
+
+print(q3_exp_profit_results)
+
+# Recommendation for Reinsurance Boundary for Product A and B to Satisfy Condition 2
+max_ceded_q3 <- 0.25 * theta * scen2_EY / reins_loading
+
+#Product A
+alpha_profit_q3 <- 1 - max_ceded_q3 / scen2_EY
+
+#Product B
+d_profit_q3 <- uniroot(function(dd) exp_claim_ceded_prodB(dd) - max_ceded_q3, c(minimum_d, 50), tol = 1e-10)$root
+
+#Ruin Probabilities Under Updated Reinsurance Parameters
+ruin_A_prof_limit <- est_ruin_prob_reins("prop_prodA", alpha = alpha_profit_q3)
+ruin_B_prof_limit <- est_ruin_prob_reins("xl_prodB",   d = d_profit_q3)
+
+
+#Expected Profit Under Recommendation
+exp_profit_prodA_limit <- exp_profit_rate_q3(type = "prop_prodA", alpha = alpha_profit_q3)
+exp_profit_prodB_limit <- exp_profit_rate_q3(type = "xl_prodB", d = d_profit_q3)
+
+
+#Results Table
+exp_profit_none_q3 <- exp_profit_rate_q3(type = "none")
+
+q3_recommendation_results <- data.frame(
+  contract   = c("No Reinsurance", "A (Specified)", "B (Specified)", "A (25% Profit Limit)", "B (25% Profit Limit)"),
+  parameter  = c(NA, prodA_alpha, prodB_d, alpha_profit_q3, d_profit_q3),
+  psi        = c(est_ruin_prod0["psi"],   est_ruin_prodA["psi"],   est_ruin_prodB["psi"], ruin_A_prof_limit["psi"],   ruin_B_prof_limit["psi"]),
+  lower      = c(est_ruin_prod0["lower"], est_ruin_prodA["lower"], est_ruin_prodB["lower"], ruin_A_prof_limit["lower"], ruin_B_prof_limit["lower"]),
+  upper      = c(est_ruin_prod0["upper"], est_ruin_prodA["upper"], est_ruin_prodB["upper"], ruin_A_prof_limit["upper"], ruin_B_prof_limit["upper"]),
+  exp_profit = c(exp_profit_none_q3, exp_profit_prodA, exp_profit_prodB, exp_profit_prodA_limit, exp_profit_prodB_limit))
+
+q3_recommendation_results$profit_reduction_pct <- 100 * (1 - q3_recommendation_results$exp_profit / exp_profit_none_q3)
+q3_recommendation_results$meets_survival_99    <- q3_recommendation_results$psi <= 0.01
+q3_recommendation_results$meets_profit_25      <- q3_recommendation_results$profit_reduction_pct <= 25 + 1e-8
+
+print(q3_recommendation_results)                                   
+```
+
+
+
+```{r}
+### Q4 Calibrating to Target Survival Probability
+# Establish Parameters
+target_psi_q4    <- 0.01
+z_95_q4          <- qnorm(0.975)
+target_half_q4   <- 0.0005   
+set.seed(676)
+
+# Simulation Size: Smallest Number of Paths for 95% CI to be Narrower than Target Tolerance
+n_required_q4    <- ceiling(z_95_q4^2 * target_psi_q4 * (1 - target_psi_q4) / target_half_q4^2)
+n_sim_q4         <- ceiling(n_required_q4 / 50000) * 50000   
+ci_half_width_q4 <- z_95_q4 * sqrt(target_psi_q4 * (1 - target_psi_q4) / n_sim_q4)
+
+q4_sim_size_results <- data.frame(n_required = n_required_q4, n_chosen = n_sim_q4, ci_half_width = ci_half_width_q4, target_half = target_half_q4)
+
+print(q4_sim_size_results)
+
+# Ruin Probability Helper
+est_ruin_prob_q4 <- function(type, value, n_sim) {
+  
+  if (type == "prop_prodA") est_ruin_prob_reins(type, alpha = value, n_sim = n_sim)
+  else                      est_ruin_prob_reins(type, d = value, n_sim = n_sim)
+  
+}
+
+# Product A 
+alpha_grid_q4 <- seq(0.60, 0.80, by = 0.01)
+prodA_q4 <- data.frame(alpha = alpha_grid_q4, t(sapply(alpha_grid_q4, function(a) est_ruin_prob_q4("prop_prodA", a, n_sim_q4))))
+
+print(prodA_q4)
+
+alpha_99_q4 <- prodA_q4$alpha[which.min(abs(prodA_q4$psi - target_psi_q4))]
+
+# Product B 
+d_grid_q4 <- seq(4, 15, by = 0.5)
+prodB_q4 <- data.frame(d = d_grid_q4, t(sapply(d_grid_q4, function(dd) est_ruin_prob_q4("xl_prodB", dd, n_sim_q4))))
+print(prodB_q4)
+
+d_99_q4 <- prodB_q4$d[which.min(abs(prodB_q4$psi - target_psi_q4))]
+
+# Results
+calibrated_prodA_q4 <- prodA_q4[prodA_q4$alpha == alpha_99_q4, ]
+calibrated_prodB_q4 <- prodB_q4[prodB_q4$d == d_99_q4, ]
+
+# Monte Carlo Sim Calibration Results
+q4_calibration_results <- data.frame(
+  contract   = c("A", "B"),
+  parameter  = c(alpha_99_q4, d_99_q4),
+  survival   = 1 - c(calibrated_prodA_q4$psi,   calibrated_prodB_q4$psi),
+  surv_lower = 1 - c(calibrated_prodA_q4$upper, calibrated_prodB_q4$upper),
+  surv_upper = 1 - c(calibrated_prodA_q4$lower, calibrated_prodB_q4$lower))
+
+print(q4_calibration_results)
+
+# Acceptable Boundary 
+prodA_q4$overlaps_target <- (1 - prodA_q4$upper) <= 0.9905 & (1 - prodA_q4$lower) >= 0.9895
+prodB_q4$overlaps_target <- (1 - prodB_q4$upper) <= 0.9905 & (1 - prodB_q4$lower) >= 0.9895
+
+print(prodA_q4[prodA_q4$overlaps_target, ])
+print(prodB_q4[prodB_q4$overlaps_target, ])
+
+# Create Table for Report
+idx_A_q4 <- which(prodA_q4$alpha == alpha_99_q4) + (-1:1)
+idx_B_q4 <- which(prodB_q4$d == d_99_q4) + (-1:1)
+q4_neighbourhood <- rbind(
+  data.frame(contract = "A", parameter = prodA_q4$alpha[idx_A_q4], prodA_q4[idx_A_q4, c("psi", "lower", "upper", "overlaps_target")],
+             exp_profit = sapply(prodA_q4$alpha[idx_A_q4], function(a) exp_profit_rate_q3("prop_prodA", alpha = a))),
+  data.frame(contract = "B", parameter = prodB_q4$d[idx_B_q4], prodB_q4[idx_B_q4, c("psi", "lower", "upper", "overlaps_target")],
+             exp_profit = sapply(prodB_q4$d[idx_B_q4], function(dd) exp_profit_rate_q3("xl_prodB", d = dd))))
+q4_neighbourhood$survival   <- 1 - q4_neighbourhood$psi
+q4_neighbourhood$surv_lower <- 1 - q4_neighbourhood$upper
+q4_neighbourhood$surv_upper <- 1 - q4_neighbourhood$lower
+q4_neighbourhood$profit_reduction_pct <- 100 * (1 - q4_neighbourhood$exp_profit / exp_profit_none_q3)
+print(q4_neighbourhood)
+```
+
+
+```{r}
+### Q5 - Sensitivity Analysis
+set.seed(676)
+
+# Product B - Specified Retention (d = 3.889)
+base_ruin_q5   <- est_ruin_prob_reins(type = "xl_prodB", d = prodB_d, n_sim = n_sim_q4)
+base_profit_q5 <- exp_profit_rate_q3(type = "xl_prodB", d = prodB_d)
+
+# Establish Cases 
+sensitivity_cases_q5 <- expand.grid(input  = c("c0", "d", "theta", "xi"),
+                             change = c(-0.10, 0.10),
+                             stringsAsFactors = FALSE)
+
+# Run Sensitivity Analysis
+sensitivity_analysis_q5 <- t(sapply(seq_len(nrow(sensitivity_cases_q5)), function(k) {
+  
+  inputs  <- list(c0 = c_0, d = prodB_d, theta = theta, xi = reins_loading)
+  changed <- sensitivity_cases_q5$input[k]
+  inputs[[changed]] <- inputs[[changed]] * (1 + sensitivity_cases_q5$change[k])
+
+  ruin   <- est_ruin_prob_reins(type = "xl_prodB", d = inputs$d, c0 = inputs$c0, loading = inputs$theta, xi = inputs$xi, n_sim = n_sim_q4)
+  
+  profit <- exp_profit_rate_q3(type = "xl_prodB", d = inputs$d, loading = inputs$theta, xi = inputs$xi)
+  
+  c(ruin, exp_profit = profit)
+}))
+
+# Results
+q5_sensitivity_results <- data.frame(sensitivity_cases_q5, sensitivity_analysis_q5)
+q5_sensitivity_results$pct_change_psi    <- 100 * (q5_sensitivity_results$psi / base_ruin_q5["psi"] - 1)
+q5_sensitivity_results$pct_change_profit <- 100 * (q5_sensitivity_results$exp_profit / base_profit_q5 - 1)
+
+print(q5_sensitivity_results)
+
+print(base_ruin_q5)
+
+#Q5 Ranking Results by Change in Ruin Probability
+q5_ranking <- data.frame(
+  input   = c("c0", "d", "theta", "xi"),
+  minus10 = q5_sensitivity_results$pct_change_psi[q5_sensitivity_results$change < 0],
+  plus10  = q5_sensitivity_results$pct_change_psi[q5_sensitivity_results$change > 0])
+q5_ranking$swing     <- abs(q5_ranking$plus10 - q5_ranking$minus10)
+q5_ranking$asymmetry <- abs(q5_ranking$plus10) - abs(q5_ranking$minus10)
+q5_ranking$rank      <- rank(-q5_ranking$swing)
+q5_ranking <- q5_ranking[order(q5_ranking$rank), ]
+print(q5_ranking)
 ```
 
